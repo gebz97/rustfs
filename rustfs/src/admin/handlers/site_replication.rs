@@ -287,9 +287,7 @@ struct SiteReplicationAddPreflightInfo {
     name: String,
     endpoint: String,
     deployment_id: String,
-    enabled: bool,
     bucket_count: usize,
-    peer_deployment_ids: BTreeSet<String>,
     idp_settings: serde_json::Value,
 }
 
@@ -1121,9 +1119,7 @@ fn add_preflight_info_from_sr_info(
         name: if info.name.is_empty() { site.name.clone() } else { info.name },
         endpoint: site.endpoint.clone(),
         deployment_id: info.deployment_id,
-        enabled: info.enabled,
         bucket_count: info.buckets.len(),
-        peer_deployment_ids: info.state.peers.keys().cloned().collect(),
         idp_settings: idp_settings_value(&idp_settings)?,
     })
 }
@@ -1168,10 +1164,15 @@ async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationA
     add_preflight_info_from_sr_info(site, info, idp_settings)
 }
 
-fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], local_peer: &PeerInfo) -> S3Result<()> {
+fn validate_add_preflight_topology(
+    infos: &[SiteReplicationAddPreflightInfo],
+    local_peer: &PeerInfo,
+    current_peer_ids: &BTreeSet<String>,
+) -> S3Result<()> {
     let mut deployment_ids = HashSet::new();
     let mut local_seen = false;
-    let mut non_empty_sites = Vec::new();
+    let mut local_has_buckets = false;
+    let mut new_non_local_site_with_buckets = None;
     let local_idp = infos
         .iter()
         .find(|info| info.deployment_id == local_peer.deployment_id)
@@ -1190,9 +1191,11 @@ fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], lo
         }
         if info.deployment_id == local_peer.deployment_id {
             local_seen = true;
+            local_has_buckets = info.bucket_count > 0;
+            continue;
         }
-        if info.bucket_count > 0 {
-            non_empty_sites.push(info.name.clone());
+        if info.bucket_count > 0 && !current_peer_ids.contains(&info.deployment_id) {
+            new_non_local_site_with_buckets = Some(info.name.as_str());
         }
     }
 
@@ -1215,23 +1218,38 @@ fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], lo
         }
     }
 
-    if non_empty_sites.len() > 1 {
-        return Err(s3_error!(
-            InvalidRequest,
-            "site replication can be initialized with data on only one site; non-empty sites: {}",
-            non_empty_sites.join(", ")
-        ));
-    }
-
     let requested: BTreeSet<String> = infos.iter().map(|info| info.deployment_id.clone()).collect();
-    for info in infos.iter().filter(|info| info.enabled) {
-        if !info.peer_deployment_ids.is_empty() && info.peer_deployment_ids != requested {
+    if !current_peer_ids.is_empty() {
+        if current_peer_ids == &requested {
             return Err(s3_error!(
                 InvalidRequest,
-                "site `{}` is already configured with a different site replication peer set",
-                info.endpoint
+                "site replication is already configured with the requested peer set"
             ));
         }
+        if !current_peer_ids.is_subset(&requested) {
+            let missing = current_peer_ids
+                .difference(&requested)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(s3_error!(
+                InvalidRequest,
+                "all existing replicated sites must be specified; missing deploymentIDs: {missing}"
+            ));
+        }
+    }
+
+    if let Some(site) = new_non_local_site_with_buckets {
+        if local_has_buckets {
+            return Err(s3_error!(
+                InvalidRequest,
+                "site replication can be initialized with data on only one site"
+            ));
+        }
+        return Err(s3_error!(
+            InvalidRequest,
+            "please send your request to the site containing data/buckets: {site}"
+        ));
     }
 
     Ok(())
@@ -4817,7 +4835,8 @@ impl Operation for SiteReplicationAddHandler {
                 preflight_infos.push(remote_add_preflight_info(site).await?);
             }
         }
-        validate_add_preflight_topology(&preflight_infos, &local_peer)?;
+        let current_peer_ids = current_state.peers.keys().cloned().collect();
+        validate_add_preflight_topology(&preflight_infos, &local_peer, &current_peer_ids)?;
         let (service_account_access_key, service_account_secret_key) =
             ensure_site_replicator_service_account(&cred.access_key, false).await?;
         let mut state = merge_add_sites(
@@ -6020,9 +6039,7 @@ mod tests {
             name: name.to_string(),
             endpoint: endpoint.to_string(),
             deployment_id: deployment_id.to_string(),
-            enabled: false,
             bucket_count,
-            peer_deployment_ids: BTreeSet::new(),
             idp_settings: serde_json::json!({"provider": "same"}),
         }
     }
@@ -6038,7 +6055,7 @@ mod tests {
             preflight_site("remote", "https://remote.example.com", "remote-dep", 0),
         ];
 
-        validate_add_preflight_topology(&infos, &local_peer).expect("matching preflight should pass");
+        validate_add_preflight_topology(&infos, &local_peer, &BTreeSet::new()).expect("matching preflight should pass");
     }
 
     #[test]
@@ -6052,7 +6069,8 @@ mod tests {
             preflight_site("remote", "https://remote.example.com", "local-dep", 0),
         ];
 
-        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("duplicate deploymentID should fail");
+        let err = validate_add_preflight_topology(&infos, &local_peer, &BTreeSet::new())
+            .expect_err("duplicate deploymentID should fail");
 
         assert!(err.to_string().contains("duplicate deploymentID"));
     }
@@ -6065,7 +6083,8 @@ mod tests {
         };
         let infos = vec![preflight_site("remote", "https://remote.example.com", "remote-dep", 0)];
 
-        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("missing local deployment should fail");
+        let err = validate_add_preflight_topology(&infos, &local_peer, &BTreeSet::new())
+            .expect_err("missing local deployment should fail");
 
         assert!(err.to_string().contains("must include the local deployment"));
     }
@@ -6080,13 +6099,13 @@ mod tests {
         remote.idp_settings = serde_json::json!({"provider": "different"});
         let infos = vec![preflight_site("local", "https://local.example.com", "local-dep", 0), remote];
 
-        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("IDP mismatch should fail");
+        let err = validate_add_preflight_topology(&infos, &local_peer, &BTreeSet::new()).expect_err("IDP mismatch should fail");
 
         assert!(err.to_string().contains("IDP settings mismatch"));
     }
 
     #[test]
-    fn test_validate_add_preflight_topology_rejects_multiple_non_empty_sites() {
+    fn test_validate_add_preflight_topology_rejects_local_and_new_remote_non_empty_sites() {
         let local_peer = PeerInfo {
             deployment_id: "local-dep".to_string(),
             ..peer("local", "https://local.example.com")
@@ -6096,26 +6115,98 @@ mod tests {
             preflight_site("remote", "https://remote.example.com", "remote-dep", 1),
         ];
 
-        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("multiple non-empty sites should fail");
+        let err = validate_add_preflight_topology(&infos, &local_peer, &BTreeSet::new())
+            .expect_err("multiple non-empty sites should fail");
 
         assert!(err.to_string().contains("only one site"));
     }
 
     #[test]
-    fn test_validate_add_preflight_topology_rejects_existing_peer_set_mismatch() {
+    fn test_validate_add_preflight_topology_rejects_new_remote_non_empty_site_when_local_empty() {
         let local_peer = PeerInfo {
             deployment_id: "local-dep".to_string(),
             ..peer("local", "https://local.example.com")
         };
-        let local = preflight_site("local", "https://local.example.com", "local-dep", 0);
-        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
-        remote.enabled = true;
-        remote.peer_deployment_ids = BTreeSet::from(["remote-dep".to_string(), "old-dep".to_string()]);
-        let infos = vec![local, remote];
+        let infos = vec![
+            preflight_site("local", "https://local.example.com", "local-dep", 0),
+            preflight_site("remote", "https://remote.example.com", "remote-dep", 1),
+        ];
 
-        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("peer set mismatch should fail");
+        let err = validate_add_preflight_topology(&infos, &local_peer, &BTreeSet::new())
+            .expect_err("request should be sent to non-empty remote site");
 
-        assert!(err.to_string().contains("different site replication peer set"));
+        assert!(err.to_string().contains("site containing data/buckets"));
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_accepts_non_empty_existing_sites_when_extending() {
+        let local_peer = PeerInfo {
+            deployment_id: "site1-dep".to_string(),
+            ..peer("site1", "https://site1.example.com")
+        };
+        let site1 = preflight_site("site1", "https://site1.example.com", "site1-dep", 1);
+        let site2 = preflight_site("site2", "https://site2.example.com", "site2-dep", 1);
+        let site3 = preflight_site("site3", "https://site3.example.com", "site3-dep", 1);
+        let site4 = preflight_site("site4", "https://site4.example.com", "site4-dep", 0);
+        let infos = vec![site1, site2, site3, site4];
+        let current_peer_ids = BTreeSet::from(["site1-dep".to_string(), "site2-dep".to_string(), "site3-dep".to_string()]);
+
+        validate_add_preflight_topology(&infos, &local_peer, &current_peer_ids)
+            .expect("empty new site should join non-empty existing peers");
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_rejects_non_empty_new_site_when_extending() {
+        let local_peer = PeerInfo {
+            deployment_id: "site1-dep".to_string(),
+            ..peer("site1", "https://site1.example.com")
+        };
+        let site1 = preflight_site("site1", "https://site1.example.com", "site1-dep", 1);
+        let site2 = preflight_site("site2", "https://site2.example.com", "site2-dep", 1);
+        let site3 = preflight_site("site3", "https://site3.example.com", "site3-dep", 1);
+        let site4 = preflight_site("site4", "https://site4.example.com", "site4-dep", 1);
+        let infos = vec![site1, site2, site3, site4];
+        let current_peer_ids = BTreeSet::from(["site1-dep".to_string(), "site2-dep".to_string(), "site3-dep".to_string()]);
+
+        let err =
+            validate_add_preflight_topology(&infos, &local_peer, &current_peer_ids).expect_err("non-empty new site should fail");
+
+        assert!(err.to_string().contains("only one site"));
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_rejects_request_without_new_site() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let infos = vec![
+            preflight_site("local", "https://local.example.com", "local-dep", 0),
+            preflight_site("remote", "https://remote.example.com", "remote-dep", 0),
+        ];
+        let current_peer_ids = BTreeSet::from(["local-dep".to_string(), "remote-dep".to_string()]);
+
+        let err = validate_add_preflight_topology(&infos, &local_peer, &current_peer_ids).expect_err("no new site should fail");
+
+        assert!(err.to_string().contains("already configured"));
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_requires_all_existing_sites_when_extending() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let infos = vec![
+            preflight_site("local", "https://local.example.com", "local-dep", 0),
+            preflight_site("new", "https://new.example.com", "new-dep", 0),
+        ];
+        let current_peer_ids = BTreeSet::from(["local-dep".to_string(), "remote-dep".to_string()]);
+
+        let err = validate_add_preflight_topology(&infos, &local_peer, &current_peer_ids)
+            .expect_err("missing existing replicated site should fail");
+
+        assert!(err.to_string().contains("all existing replicated sites must be specified"));
     }
 
     #[test]

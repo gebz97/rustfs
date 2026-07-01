@@ -124,6 +124,45 @@ services:
       site-replication-volume-permission-helper:
         condition: service_completed_successfully
 
+  rustfs-site4:
+    image: ${RUSTFS_SITE_REPL_IMAGE:-rustfs/rustfs:latest}
+    container_name: rustfs-site-repl-4
+    profiles:
+      - new-site
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "9030:9000"
+      - "9031:9001"
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_ACCESS_KEY=${RUSTFS_SITE_REPL_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SITE_REPL_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_SITE_REPL_LOG_LEVEL:-info}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+    volumes:
+      - site4_data_0:/data/rustfs0
+      - site4_data_1:/data/rustfs1
+      - site4_data_2:/data/rustfs2
+      - site4_data_3:/data/rustfs3
+      - site4_logs:/app/logs
+    networks:
+      - rustfs-site-replication
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      site-replication-volume-permission-helper:
+        condition: service_completed_successfully
+
   site-replication-setup:
     image: minio/mc:latest
     container_name: rustfs-site-repl-setup
@@ -174,25 +213,133 @@ services:
         fi
 
         mc mb --ignore-existing "site1/$${bucket}"
-        printf 'rustfs 3-site replication check\n' > /tmp/site-replication-check.txt
-        mc cp /tmp/site-replication-check.txt "site1/$${bucket}/from-site1.txt"
 
-        for site in site2 site3; do
+        wait_for_object() {
+          target_site="$${1}"
+          target_object="$${2}"
           for attempt in $$(seq 1 60); do
-            if mc stat "$${site}/$${bucket}/from-site1.txt" >/dev/null 2>&1; then
-              echo "$${site} received replicated object"
-              break
+            if mc stat "$${target_site}/$${bucket}/$${target_object}" >/dev/null 2>&1; then
+              echo "$${target_site} received $${target_object}"
+              return 0
             fi
             if [ "$${attempt}" = "60" ]; then
-              echo "$${site} did not receive replicated object in time"
-              exit 1
+              echo "$${target_site} did not receive $${target_object} in time"
+              return 1
             fi
+            sleep 2
+          done
+        }
+
+        create_and_check_object() {
+          source_site="$${1}"
+          object_name="$${2}"
+          body="$${3}"
+          shift 3
+
+          printf '%s\n' "$${body}" > "/tmp/$${object_name}"
+          mc cp "/tmp/$${object_name}" "$${source_site}/$${bucket}/pre-site4/$${object_name}"
+
+          for target_site in "$${@}"; do
+            wait_for_object "$${target_site}" "pre-site4/$${object_name}"
+          done
+        }
+
+        create_and_check_object site1 from-site1.txt 'rustfs pre-site4 object from site1' site2 site3
+        create_and_check_object site2 from-site2.txt 'rustfs pre-site4 object from site2' site1 site3
+        create_and_check_object site3 from-site3.txt 'rustfs pre-site4 object from site3' site1 site2
+
+        mc admin replicate status site1
+        echo "3-site replication example is ready"
+    restart: "no"
+
+  site-replication-expand-site4:
+    image: minio/mc:latest
+    container_name: rustfs-site-repl-expand-site4
+    profiles:
+      - new-site
+    depends_on:
+      site-replication-setup:
+        condition: service_completed_successfully
+      rustfs-site4:
+        condition: service_healthy
+    environment:
+      - RUSTFS_SITE_REPL_ACCESS_KEY=${RUSTFS_SITE_REPL_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SITE_REPL_SECRET_KEY=${RUSTFS_SITE_REPL_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_SITE_REPL_BUCKET=${RUSTFS_SITE_REPL_BUCKET:-site-repl-demo}
+      - RUSTFS_SITE_REPL_ENABLE_ILM_EXPIRY=${RUSTFS_SITE_REPL_ENABLE_ILM_EXPIRY:-false}
+    networks:
+      - rustfs-site-replication
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+
+        access_key="$${RUSTFS_SITE_REPL_ACCESS_KEY}"
+        secret_key="$${RUSTFS_SITE_REPL_SECRET_KEY}"
+        bucket="$${RUSTFS_SITE_REPL_BUCKET}"
+
+        mc alias set site1 http://rustfs-site1:9000 "$${access_key}" "$${secret_key}"
+        mc alias set site2 http://rustfs-site2:9000 "$${access_key}" "$${secret_key}"
+        mc alias set site3 http://rustfs-site3:9000 "$${access_key}" "$${secret_key}"
+        mc alias set site4 http://rustfs-site4:9000 "$${access_key}" "$${secret_key}"
+
+        for site in site1 site2 site3 site4; do
+          until mc ls "$${site}" >/dev/null 2>&1; do
+            echo "waiting for $${site} S3 API"
             sleep 2
           done
         done
 
+        ilm_flag=""
+        if [ "$${RUSTFS_SITE_REPL_ENABLE_ILM_EXPIRY}" = "true" ]; then
+          ilm_flag="--replicate-ilm-expiry"
+        fi
+
+        wait_for_object() {
+          target_site="$${1}"
+          target_object="$${2}"
+          for attempt in $$(seq 1 90); do
+            if mc stat "$${target_site}/$${bucket}/$${target_object}" >/dev/null 2>&1; then
+              echo "$${target_site} received $${target_object}"
+              return 0
+            fi
+            if [ "$${attempt}" = "90" ]; then
+              echo "$${target_site} did not receive $${target_object} in time"
+              return 1
+            fi
+            sleep 2
+          done
+        }
+
+        echo "joining site4 to the existing 3-site replication set"
+        if ! mc admin replicate add site1 site2 site3 site4 $${ilm_flag}; then
+          echo "replicate add with site4 failed; showing replication info before exiting"
+          mc admin replicate info site1 || true
+          mc admin replicate info site4 || true
+          exit 1
+        fi
+
+        for object in \
+          pre-site4/from-site1.txt \
+          pre-site4/from-site2.txt \
+          pre-site4/from-site3.txt
+        do
+          wait_for_object site4 "$${object}"
+        done
+
+        printf 'rustfs post-site4 object from site4\n' > /tmp/from-site4-after-join.txt
+        mc cp /tmp/from-site4-after-join.txt "site4/$${bucket}/post-site4/from-site4.txt"
+        for site in site1 site2 site3; do
+          wait_for_object "$${site}" "post-site4/from-site4.txt"
+        done
+
+        printf 'rustfs post-site4 object from site1\n' > /tmp/from-site1-after-join.txt
+        mc cp /tmp/from-site1-after-join.txt "site1/$${bucket}/post-site4/from-site1.txt"
+        wait_for_object site4 "post-site4/from-site1.txt"
+
         mc admin replicate status site1
-        echo "3-site replication example is ready"
+        mc admin replicate status site4
+        echo "site4 join and replication check passed"
     restart: "no"
 
   site-replication-volume-permission-helper:
@@ -213,9 +360,14 @@ services:
       - site3_data_2:/site3/data2
       - site3_data_3:/site3/data3
       - site3_logs:/site3/logs
+      - site4_data_0:/site4/data0
+      - site4_data_1:/site4/data1
+      - site4_data_2:/site4/data2
+      - site4_data_3:/site4/data3
+      - site4_logs:/site4/logs
     command: >
       sh -c "
-        chown -R 10001:10001 /site1 /site2 /site3 &&
+        chown -R 10001:10001 /site1 /site2 /site3 /site4 &&
         echo 'site replication volume permissions fixed'
       "
     networks:
@@ -241,3 +393,8 @@ volumes:
   site3_data_2:
   site3_data_3:
   site3_logs:
+  site4_data_0:
+  site4_data_1:
+  site4_data_2:
+  site4_data_3:
+  site4_logs:

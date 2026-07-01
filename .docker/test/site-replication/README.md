@@ -2,19 +2,22 @@
 
 ## Purpose
 
-This directory contains a local three-site RustFS site replication check. It is intended to verify the admin site-replication flow against real containers:
+This directory contains a local RustFS site replication check. It is intended to verify the admin site-replication flow against real containers:
 
 - three independent RustFS sites start successfully
-- the MinIO-compatible `mc admin replicate add` command configures all three sites
-- a bucket and object written to site 1 are replicated to site 2 and site 3
+- the `mc admin replicate add` command configures all three sites
+- a bucket and objects written to the first three sites are replicated across the three-site set
+- an optional fourth site can be started after data exists, joined to the replication set, and verified for back-fill and new object replication
 - `mc admin replicate status` can read the resulting site-replication state
 
 The compose file uses named volumes so the test does not require preparing host bind-mount directories.
 Because Docker named volumes usually share the same physical device in local desktop environments, this test compose defaults `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true`. Keep that setting limited to local test and CI environments.
 
+For the user-facing site replication topology rules, see `docs/operations/site-replication.md`.
+
 ## Files
 
-- `docker-compose.yml`: three RustFS sites, a volume permission helper, and a one-shot setup/check container
+- `docker-compose.yml`: three default RustFS sites, an optional fourth site, a volume permission helper, and one-shot setup/check containers
 - `run-object-flow-check.sh`: host-side upload/download verification for replicated 10 MiB to 100 MiB objects
 
 ## Ports
@@ -27,6 +30,8 @@ Default host endpoints:
 - Site 2 Console: `http://127.0.0.1:9011`
 - Site 3 API: `http://127.0.0.1:9020`
 - Site 3 Console: `http://127.0.0.1:9021`
+- Site 4 API: `http://127.0.0.1:9030` (only with the `new-site` profile)
+- Site 4 Console: `http://127.0.0.1:9031` (only with the `new-site` profile)
 
 Default credentials are `rustfsadmin` / `rustfsadmin`. These are for local testing only.
 
@@ -53,6 +58,17 @@ docker compose -f .docker/test/site-replication/docker-compose.yml up -d
 docker compose -f .docker/test/site-replication/docker-compose.yml logs -f site-replication-setup
 ```
 
+To test adding a new site after the initial three-site set already contains objects, first let `site-replication-setup` complete, then start the `new-site` profile:
+
+```bash
+docker compose -f .docker/test/site-replication/docker-compose.yml up -d
+docker compose -f .docker/test/site-replication/docker-compose.yml logs -f site-replication-setup
+docker compose -f .docker/test/site-replication/docker-compose.yml --profile new-site up -d --no-deps rustfs-site4
+docker compose -f .docker/test/site-replication/docker-compose.yml --profile new-site up --no-deps \
+  --abort-on-container-exit --exit-code-from site-replication-expand-site4 \
+  site-replication-expand-site4
+```
+
 ## Test Flow
 
 The compose stack performs these steps:
@@ -69,11 +85,29 @@ The compose stack performs these steps:
 mc admin replicate add site1 site2 site3
 ```
 
-8. It creates the test bucket on site 1 and uploads `from-site1.txt`.
-9. It polls site 2 and site 3 until the replicated object is visible.
+8. It creates the test bucket on site 1 and uploads pre-site4 objects from site 1, site 2, and site 3.
+9. It polls the other two sites for each object until the replicated objects are visible.
 10. It prints `mc admin replicate status site1`.
 
 The setup container exits with status `0` only after the object replication check passes.
+
+## New Site Join Check
+
+The `new-site` profile starts `rustfs-site4` only after the default three-site setup has completed. The `site-replication-expand-site4` container then:
+
+1. Configures aliases for all four sites.
+2. Runs:
+
+```bash
+mc admin replicate add site1 site2 site3 site4
+```
+
+3. Waits for the objects that existed before site 4 joined to appear on site 4.
+4. Uploads a new object to site 4 and waits for it on sites 1, 2, and 3.
+5. Uploads a new object to site 1 and waits for it on site 4.
+6. Prints replication status from site 1 and site 4.
+
+The expansion container exits with status `0` only after both back-fill and post-join replication checks pass.
 
 ## Object Flow Check
 
@@ -149,11 +183,14 @@ After the setup container succeeds, you can inspect the sites with `mc` from the
 mc alias set site1 http://127.0.0.1:9000 rustfsadmin rustfsadmin
 mc alias set site2 http://127.0.0.1:9010 rustfsadmin rustfsadmin
 mc alias set site3 http://127.0.0.1:9020 rustfsadmin rustfsadmin
+mc alias set site4 http://127.0.0.1:9030 rustfsadmin rustfsadmin
 
 mc admin replicate info site1
 mc admin replicate status site1
-mc stat site2/site-repl-demo/from-site1.txt
-mc stat site3/site-repl-demo/from-site1.txt
+mc stat site2/site-repl-demo/pre-site4/from-site1.txt
+mc stat site3/site-repl-demo/pre-site4/from-site1.txt
+mc stat site4/site-repl-demo/pre-site4/from-site1.txt
+mc stat site4/site-repl-demo/post-site4/from-site1.txt
 ```
 
 After larger object flow checks, replication should converge without a growing queue:
@@ -170,6 +207,7 @@ Useful Docker commands:
 docker compose -f .docker/test/site-replication/docker-compose.yml ps
 docker compose -f .docker/test/site-replication/docker-compose.yml logs --no-color --tail=200
 docker compose -f .docker/test/site-replication/docker-compose.yml logs --no-color site-replication-setup
+docker compose -f .docker/test/site-replication/docker-compose.yml logs --no-color site-replication-expand-site4
 ```
 
 ## Cleanup
