@@ -213,6 +213,7 @@ REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypas
 REPLICATION_EVENT_HOST_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_host_bypass_hits.txt"
 REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_filemeta_boundary_bypass_hits.txt"
 REPLICATION_FILEMETA_DIRECT_PATH_BYPASS_HITS_FILE="${TMP_DIR}/replication_filemeta_direct_path_bypass_hits.txt"
+REPLICATION_FILEMETA_DIRECT_PATH_RAW_FILE="${TMP_DIR}/replication_filemeta_direct_path_raw.txt"
 REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE="${TMP_DIR}/replication_local_path_bypass_hits.txt"
 REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary_bypass_hits.txt"
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
@@ -3037,10 +3038,21 @@ fi
 
 (
   cd "$ROOT_DIR"
+  direct_path_status=0
   rg -n --with-filename 'rustfs_filemeta::(Replicate|Replication|VersionPurge|replication_statuses_map|version_purge_statuses_map|get_replication_state|parse_replicate_decision|target_reset_header|REPLICATE_)' \
     crates/ecstore/src rustfs/src crates/scanner/src \
-    --glob '*.rs' |
-    rg -v '^crates/ecstore/src/bucket/replication/replication_filemeta_boundary\.rs:' || true
+    --glob '*.rs' >"$REPLICATION_FILEMETA_DIRECT_PATH_RAW_FILE" || direct_path_status=$?
+  if [[ "$direct_path_status" -ne 0 && "$direct_path_status" -ne 1 ]]; then
+    exit "$direct_path_status"
+  fi
+  if [[ "$direct_path_status" -eq 0 ]]; then
+    direct_path_filter_status=0
+    rg -v '^crates/ecstore/src/bucket/replication/replication_filemeta_boundary\.rs:' \
+      "$REPLICATION_FILEMETA_DIRECT_PATH_RAW_FILE" || direct_path_filter_status=$?
+    if [[ "$direct_path_filter_status" -ne 0 && "$direct_path_filter_status" -ne 1 ]]; then
+      exit "$direct_path_filter_status"
+    fi
+  fi
 ) >"$REPLICATION_FILEMETA_DIRECT_PATH_BYPASS_HITS_FILE"
 
 if [[ -s "$REPLICATION_FILEMETA_DIRECT_PATH_BYPASS_HITS_FILE" ]]; then
