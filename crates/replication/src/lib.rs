@@ -32,7 +32,7 @@ pub use delete::{
 pub use mrf::{MrfOpKind, MrfReplicateEntry, decode_mrf_file, encode_mrf_file};
 pub use object::{
     ReplicationSourceObject, ReplicationTargetObject, content_matches_by_etag, replication_action_for_target,
-    target_is_newer_than_source_null_version,
+    replication_etags_match, target_is_newer_than_source_null_version,
 };
 pub use operation::{MustReplicateOptions, is_ssec_encrypted};
 pub use queue::{ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission};

@@ -2658,7 +2658,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_object_compare_status=0
-  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct)\s+(?:ReplicationSourceObject|ReplicationTargetObject)|fn\s+(?:content_matches_by_etag|content_matches|target_is_newer_than_source_null_version|replication_action_for_target|get_replication_action))\b' \
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct)\s+(?:ReplicationSourceObject|ReplicationTargetObject)|fn\s+(?:replication_etags_match|content_matches_by_etag|content_matches|target_is_newer_than_source_null_version|replication_action_for_target|get_replication_action))\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' >"$REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE" || replication_object_compare_status=$?
   if [[ "$replication_object_compare_status" -ne 0 && "$replication_object_compare_status" -ne 1 ]]; then

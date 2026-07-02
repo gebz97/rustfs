@@ -57,10 +57,10 @@ use http_body_util::StreamBody;
 use rmp_serde;
 use rustfs_replication::{
     BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationSourceObject,
-    ReplicationTargetObject, ResyncOpts, TargetReplicationResyncStatus, content_matches_by_etag,
-    is_retryable_delete_replication_head_error, is_version_delete_replication, is_version_id_mismatch,
-    replication_action_for_target, resync_state_accepts_update, should_count_head_proxy_failure,
-    should_retry_delete_marker_purge, target_is_newer_than_source_null_version,
+    ReplicationTargetObject, ResyncOpts, TargetReplicationResyncStatus, is_retryable_delete_replication_head_error,
+    is_version_delete_replication, is_version_id_mismatch, replication_action_for_target, replication_etags_match,
+    resync_state_accepts_update, should_count_head_proxy_failure, should_retry_delete_marker_purge,
+    target_is_newer_than_source_null_version,
 };
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
@@ -2601,12 +2601,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 } else if is_version_id_format_mismatch(&e) {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
                     match head_object_fallback(&bucket, &tgt_client, &object).await {
-                        Ok(Some(oi))
-                            if content_matches_by_etag(
-                                &replication_source_object(&object_info),
-                                &replication_target_object(&oi),
-                            ) =>
-                        {
+                        Ok(Some(oi)) if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) => {
                             rinfo.replication_status = ReplicationStatusType::Completed;
                             rinfo.replication_resynced = true;
                             rinfo.replication_action = ReplicationAction::None;
@@ -2973,10 +2968,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
                     match head_object_fallback(&bucket, &tgt_client, &object).await {
                         Ok(Some(oi)) => {
-                            replication_action = if content_matches_by_etag(
-                                &replication_source_object(&object_info),
-                                &replication_target_object(&oi),
-                            ) {
+                            replication_action = if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) {
                                 ReplicationAction::None
                             } else {
                                 ReplicationAction::All
