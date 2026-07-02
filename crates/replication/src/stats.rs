@@ -24,9 +24,9 @@ const FAILURE_LAST_HOUR_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug)]
 pub struct ExponentialMovingAverage {
-    pub alpha: f64,
-    pub value: AtomicU64,
-    pub last_update: Arc<Mutex<SystemTime>>,
+    alpha: f64,
+    value: AtomicU64,
+    last_update: Arc<Mutex<SystemTime>>,
 }
 
 impl ExponentialMovingAverage {
@@ -285,7 +285,10 @@ impl InQueueMetric {
             return;
         }
 
-        let sample_count = self.samples.len() as i64;
+        let sample_count = match i64::try_from(self.samples.len()) {
+            Ok(count) => count,
+            Err(_) => i64::MAX,
+        };
         let total_bytes = self.samples.iter().map(|sample| sample.bytes).sum::<i64>();
         let total_count = self.samples.iter().map(|sample| sample.count).sum::<i64>();
         let max_bytes = self.samples.iter().map(|sample| sample.bytes).max().unwrap_or(0);
@@ -713,6 +716,45 @@ impl ActiveWorkerStat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-6, "expected {actual} to be close to {expected}");
+    }
+
+    #[test]
+    fn exponential_moving_average_decay_and_merge_are_deterministic() {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let first = ExponentialMovingAverage::new();
+        first.add_value(120.0, base);
+        first.update_exponential_moving_average(base + Duration::from_secs(60));
+
+        let decayed = 120.0 * (-1.0_f64).exp();
+        assert_close(first.get_current_average(), decayed);
+
+        let second = ExponentialMovingAverage::new();
+        second.add_value(60.0, base + Duration::from_secs(30));
+        let merged = first.merge(&second);
+
+        assert_close(merged.get_current_average(), (decayed + 60.0) / 2.0);
+    }
+
+    #[test]
+    fn xfer_stats_tracks_rates_and_merges() {
+        let mut first = XferStats::new();
+        first.add_size(120, Duration::from_secs(2));
+        assert_close(first.curr, 60.0);
+        assert_close(first.peak, 60.0);
+        assert_close(first.avg, 60.0);
+
+        let mut second = XferStats::new();
+        second.add_size(90, Duration::from_secs(1));
+
+        let merged = first.merge(&second);
+        assert_close(merged.avg, 75.0);
+        assert_close(merged.curr, 150.0);
+        assert_close(merged.peak, 90.0);
+        assert_close(merged.measure.get_current_average(), 75.0);
+    }
 
     #[test]
     fn in_queue_metric_observe_updates_rolling_stats() {
